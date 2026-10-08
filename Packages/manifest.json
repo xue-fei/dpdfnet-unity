@@ -3,7 +3,7 @@
     "com.unity.ide.visualstudio": "2.0.28",
     "com.unity.ugui": "1.0.0",
     "onnxruntime": "https://github.com/xue-fei/onnxruntime-unity.git",
-    "onnxruntime-cuda": "https://github.com/xue-fei/onnxruntime-unity-cuda.git",
+    "onnxruntime-cpu": "https://github.com/xue-fei/onnxruntime-unity-cpu.git",
     "com.unity.modules.ai": "1.0.0",
     "com.unity.modules.androidjni": "1.0.0",
     "com.unity.modules.animation": "1.0.0",
