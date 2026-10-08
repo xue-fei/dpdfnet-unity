@@ -7,5 +7,5 @@ https://huggingface.co/Ceva-IP/DPDFNet/tree/main/onnx
     
 https://github.com/xue-fei/onnxruntime-unity.git  
   
-https://github.com/xue-fei/onnxruntime-unity-cuda.git    
+https://github.com/xue-fei/onnxruntime-unity-cpu.git      
   

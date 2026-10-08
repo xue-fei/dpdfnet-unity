@@ -10,10 +10,16 @@ ONNX 模型位于 `Assets/StreamingAssets/dpdfnet/`，Unity 端逐帧执行：
 ## 已就绪的资源
 
 - `Assets/StreamingAssets/dpdfnet/*.onnx`：baseline / dpdfnet2 / dpdfnet4 / dpdfnet8（均为 **16 kHz** 模型，参数 `sr=16000, n_fft=320, hop=160, freq_bins=161`）。
-- `Assets/StreamingAssets/dpdfnet/*.json`：旁路元数据（模型自定义 metadata 被 onnxsim 剥离，故用 `DPDFNet/generate_unity_sidecar_meta.py` 基于参考工程**确定性**重建初始 state；仅 `ErbNorm`/`SpecNorm` 两切片非零，其余为 0）。
-- `Assets/Scripts/DPDFNet/`：C# 实现。
+- `Assets/Scripts/DPDFNet/`：C# 实现（已精简为 4 个文件，按层分组）：
 
-> 若日后更换/重新导出 ONNX，请重新运行 `DPDFNet/generate_unity_sidecar_meta.py` 以更新对应 JSON。
+  | 文件 | 职责 |
+  |---|---|
+  | `DpdfNetAudio.cs` | DSP 层：`VorbisWindow`（Vorbis 窗）、`StreamingStft`（流式 STFT）、`StreamingIstft`（流式 ISTFT，OLA） |
+  | `OnnxRuntimeSession.cs` | ONNX 层：`IOnnxSession` 接口 + `OnnxRuntimeSession`（Microsoft.ML.OnnxRuntime 后端，含定制版 Tensor 扁平拷贝兼容） |
+  | `DpdfNetProcessor.cs` | 模型配置 `DpdfNetModelConfig`（零依赖推导 + 初始 state 重建）+ 核心编排 `DpdfNetProcessor` |
+  | `DpdfNetMicrophoneDemo.cs` | `MonoBehaviour` Demo：麦克风 16k 采集 → 增强 → `AudioSource` 播放（无 `OnAudioFilterRead`、无重采样） |
+
+> **零依赖**：初始 state 与 DSP 参数均不在任何外部文件中。运行时从 ONNX 输入形状（`FreqBins` / `StateSize`）推导 `n_fft` / `hop` / `state_size`，并用与 Python `onnx_model/layers.py` 一致的公式重建 `ErbNorm` / `SpecNorm` 初值（仅两切片非零，其余为 0）。因此更换/重新导出 ONNX（同 16k 模型族）无需任何额外步骤。
 
 ## 依赖（需要手动加入 Unity 工程）
 
@@ -51,7 +57,7 @@ ONNX 模型位于 `Assets/StreamingAssets/dpdfnet/`，Unity 端逐帧执行：
 | 采样率 / 帧长 / 跳数 | 16000 / 320 / 160（16k 模型族） |
 | 窗 | Vorbis，分析=合成（满足 Princen-Bradley） |
 | 频谱布局 | `[1,1,161,2]`（batch, time, freq, real/imag） |
-| 状态向量 | 单维 `[state_size]`，首帧由 JSON 初值重建，逐帧 `state_out→state_in` 回传 |
+| 状态向量 | 单维 `[state_size]`，首帧由 C# 公式重建（与 Python `initial_state()` 一致），逐帧 `state_out→state_in` 回传 |
 | 归一化 `wnorm` | 已烘焙进 ONNX 图，Unity 直接喂原始 STFT |
 | FFT | Math.NET `Forward`(不缩放) / `Inverse`(含 1/N)，等价 `np.fft.rfft/irfft` |
 | 流式 ISTFT | OLA，与 `real_time_demo.py` 完全一致 |

@@ -72,18 +72,13 @@ namespace DPDFNetUnity
         {
             Cleanup();
 
-            string jsonPath = System.IO.Path.Combine(Application.streamingAssetsPath, "dpdfnet", modelName + ".json");
-            if (!System.IO.File.Exists(jsonPath))
+            // 零依赖：先加载 ONNX，再从 session 推导配置与初始 state（不再读 JSON）。
+            string onnxPath = System.IO.Path.Combine(Application.streamingAssetsPath, "dpdfnet", modelName + ".onnx");
+            if (!System.IO.File.Exists(onnxPath))
             {
-                Debug.LogError($"[DPDFNet] 未找到旁路元数据: {jsonPath}。请先运行 generate_unity_sidecar_meta.py。");
+                Debug.LogError($"[DPDFNet] 未找到 ONNX 模型: {onnxPath}");
                 return;
             }
-            var cfg = DpdfNetModelConfig.Load(System.IO.File.ReadAllText(jsonPath));
-
-            if (cfg.sample_rate != captureSampleRate)
-                Debug.LogWarning($"[DPDFNet] 模型率 {cfg.sample_rate} 与 captureSampleRate {captureSampleRate} 不一致，建议统一为 16000。");
-
-            string onnxPath = System.IO.Path.Combine(Application.streamingAssetsPath, "dpdfnet", modelName + ".onnx");
             IOnnxSession session;
             try
             {
@@ -94,6 +89,11 @@ namespace DPDFNetUnity
                 Debug.LogError($"[DPDFNet] 加载 ONNX 失败（是否已安装 Microsoft.ML.OnnxRuntime？）：{e.Message}");
                 return;
             }
+            var cfg = DpdfNetModelConfig.FromSession(session);
+
+            if (cfg.sample_rate != captureSampleRate)
+                Debug.LogWarning($"[DPDFNet] 模型率 {cfg.sample_rate} 与 captureSampleRate {captureSampleRate} 不一致，建议统一为 16000。");
+
             processor = new DpdfNetProcessor(cfg, session);
             mixBuf = new float[processor.HopLength];
 
