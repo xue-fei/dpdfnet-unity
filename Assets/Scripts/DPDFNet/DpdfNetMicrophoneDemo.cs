@@ -1,27 +1,33 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 
 namespace DPDFNetUnity
 {
     /// <summary>
-    /// 实时麦克风降噪 Demo：挂在带 AudioSource 的 GameObject 上。
-    /// 麦克风音频经 OnAudioFilterRead 逐帧送入 DPDFNetProcessor，增强后回写。
+    /// 实时麦克风降噪 Demo（无 OnAudioFilterRead / 无重采样架构）。
     ///
-    /// 关键：OnAudioFilterRead 的 data 处于 Unity 输出采样率(AudioSettings.outputSampleRate)，
-    /// 不一定是模型率(16000)。因此重采样决策基于 outputSampleRate，而非麦克风 clip 的 native 率。
-    /// 若直接把 48k 的 data 当 16k 喂给模型，模型会把分布外输入当成噪声抑制→静音。
+    /// 参考原工程 DPDFNet/real_time_demo.py 的本质：采集率 == 模型率 == 播放率（均为 16 kHz），
+    /// 因此全程不需要重采样，也不存在此前 OnAudioFilterRead(data 处于输出率) 导致的采样率错位与队列漂移。
     ///
-    /// 建议戴耳机避免啸叫。若听不到声音，先把 monitorBypass 设为 true：
-    ///   - 仍听不到 → 麦克风采集/输出路由问题（检查权限、AudioListener、是否戴耳机）。
-    ///   - 能听到 → 采集正常，问题在模型/重采样（此时应已修复）。
+    /// 管线：
+    ///   麦克风(16000) --Microphone.GetData 逐帧--> DPDFNetProcessor.ProcessFrame(hop=160)
+    ///        --> 增强样本入播放环形队列 --> PCMReaderCallback 喂给 playClip --> AudioSource 播放。
+    ///
+    /// 说明：
+    ///   - 用 Microphone.GetData 轮询读取（带环绕安全处理 + 跨帧 leftover 续传，不丢样本）。
+    ///   - 播放通过 AudioClip.Create 的 PCMReaderCallback 提供数据，AudioSource 直接播放该 clip。
+    ///     PCMReaderCallback 是 clip 的数据供给回调，并非 OnAudioFilterRead。
+    ///   - 采集时钟与播放时钟均源自同一音频硬件、同为 16000，速率天然匹配，环形队列仅作平滑缓冲。
+    /// 建议戴耳机避免啸叫。
     /// </summary>
     [RequireComponent(typeof(AudioSource))]
     public class DpdfNetMicrophoneDemo : MonoBehaviour
     {
         [Header("模型")]
         [Tooltip("StreamingAssets/dpdfnet 下的模型名（不含扩展名）")] public string modelName = "dpdfnet2";
-        [Tooltip("请求麦克风采样率，默认 16000 与模型一致")] public int captureSampleRate = 16000;
+        [Tooltip("请求麦克风采样率，必须与模型一致(16000)")] public int captureSampleRate = 16000;
 
         [Header("输出")]
         [Range(0f, 1f)] public float playbackMix = 0f;   // 0=纯增强, 1=纯原始
@@ -34,23 +40,28 @@ namespace DPDFNetUnity
 
         private DpdfNetProcessor processor;
         private AudioClip micClip;
+        private AudioClip playClip;
         private string micDevice;
+        private AudioSource src;
         private int micRate;
-        private int dspRate;
-        private bool needsResample;
-        private AudioResampler inResampler;
-        private AudioResampler outResampler;
 
-        private readonly Queue<float> inputQueue = new Queue<float>();
-        private readonly Queue<float> outputQueue = new Queue<float>();
-        private float agcGain = 1f;
+        // 播放环形队列（主线程写，音频线程读）。用 lock 保护。
+        private readonly Queue<float> playbackQueue = new Queue<float>();
+        private readonly object queueLock = new object();
+        private const int MaxQueueSamples = 16000 * 4;   // 4s 上限，溢出丢弃最旧
+
+        // 麦克风读取游标与跨帧续传
+        private int micPrevPos;
+        private readonly Queue<float> pending = new Queue<float>();
+        private float[] mixBuf;
+        private bool running;
 
         // 诊断累计
-        private int filterCalls;
         private float diagTimer;
         private float inRmsSum, outRmsSum;
         private int rmsFrames;
         private bool loggedModelError;
+        private float agcGain = 1f;
 
         void Start() => Initialize();
         void OnDisable() => Cleanup();
@@ -69,6 +80,9 @@ namespace DPDFNetUnity
             }
             var cfg = DpdfNetModelConfig.Load(System.IO.File.ReadAllText(jsonPath));
 
+            if (cfg.sample_rate != captureSampleRate)
+                Debug.LogWarning($"[DPDFNet] 模型率 {cfg.sample_rate} 与 captureSampleRate {captureSampleRate} 不一致，建议统一为 16000。");
+
             string onnxPath = System.IO.Path.Combine(Application.streamingAssetsPath, "dpdfnet", modelName + ".onnx");
             IOnnxSession session;
             try
@@ -81,6 +95,7 @@ namespace DPDFNetUnity
                 return;
             }
             processor = new DpdfNetProcessor(cfg, session);
+            mixBuf = new float[processor.HopLength];
 
             if (Microphone.devices.Length == 0)
             {
@@ -88,72 +103,86 @@ namespace DPDFNetUnity
                 return;
             }
             micDevice = Microphone.devices[0];
-            micClip = Microphone.Start(micDevice, true, 2, captureSampleRate);
+            // 直接以模型率(16000)录制，原生即 16k，无需重采样。
+            micClip = Microphone.Start(micDevice, true, 1, captureSampleRate);
             micRate = micClip.frequency;
-            dspRate = AudioSettings.outputSampleRate;
 
-            // 重采样必须基于 data 的真实速率(outputSampleRate)，否则 48k data 当 16k 喂模型会静音。
-            needsResample = dspRate != cfg.sample_rate;
-            if (needsResample)
+            // 播放 clip：16k、单声道、循环、由 PCMReaderCallback 持续供给增强后的样本。
+            playClip = AudioClip.Create("DPDFNetOut", captureSampleRate * 2, 1, captureSampleRate, true, OnAudioRead, null);
+            src = GetComponent<AudioSource>();
+            src.clip = playClip;
+            src.loop = true;
+            src.playOnAwake = false;
+            src.Play();
+
+            micPrevPos = 0;
+            pending.Clear();
+            lock (queueLock) playbackQueue.Clear();
+            running = true;
+            StartCoroutine(CaptureLoop());
+            Debug.Log($"[DPDFNet] 采集率={micRate}, 模型率={cfg.sample_rate}, 播放率={captureSampleRate}（全程 16k，无重采样）");
+        }
+
+        private IEnumerator CaptureLoop()
+        {
+            int total = micClip.samples;
+            int hop = processor.HopLength;
+            float[] hopBuf = new float[hop];
+            while (running && micClip != null)
             {
-                inResampler = new AudioResampler(dspRate, cfg.sample_rate);
-                outResampler = new AudioResampler(cfg.sample_rate, dspRate);
-                Debug.Log($"[DPDFNet] 重采样 {dspRate} -> {cfg.sample_rate} -> {dspRate}");
+                int pos = Microphone.GetPosition(micDevice);
+                int avail = (pos - micPrevPos + total) % total;
+                if (avail > 0)
+                {
+                    // 环绕安全读取 avail 个样本到 region（最多 2 次 GetData）。
+                    float[] region = new float[avail];
+                    int first = Math.Min(avail, total - micPrevPos);
+                    if (first == avail)
+                    {
+                        micClip.GetData(region, micPrevPos);
+                    }
+                    else
+                    {
+                        float[] head = new float[first];
+                        micClip.GetData(head, micPrevPos);
+                        Array.Copy(head, 0, region, 0, first);
+                        float[] tail = new float[avail - first];
+                        micClip.GetData(tail, 0);
+                        Array.Copy(tail, 0, region, first, avail - first);
+                    }
+                    micPrevPos = (micPrevPos + avail) % total;
+
+                    // 入 pending，按 hop 精确切帧（跨帧 leftover 续传，不丢样本）。
+                    for (int i = 0; i < avail; i++) pending.Enqueue(region[i]);
+                    while (pending.Count >= hop)
+                    {
+                        for (int i = 0; i < hop; i++) hopBuf[i] = pending.Dequeue();
+                        ProcessHop(hopBuf);
+                    }
+                }
+                yield return null;
+            }
+        }
+
+        private void ProcessHop(float[] hop)
+        {
+            // 诊断：输入 RMS
+            double inSq = 0;
+            for (int i = 0; i < hop.Length; i++) inSq += hop[i] * hop[i];
+            float inRms = (float)Math.Sqrt(inSq / hop.Length + 1e-12f);
+
+            float[] enh;
+            if (monitorBypass)
+            {
+                enh = hop;             // 跳过模型，原样透传
+                lastInferenceMs = 0f;
             }
             else
             {
-                Debug.Log($"[DPDFNet] 无需重采样 (dspRate={dspRate}, model={cfg.sample_rate})");
-            }
-
-            var src = GetComponent<AudioSource>();
-            src.clip = micClip;
-            src.loop = true;
-            src.Play();
-            Debug.Log($"[DPDFNet] micRate={micRate}, dspRate={dspRate}, captureSampleRate={captureSampleRate}");
-        }
-
-        void OnAudioFilterRead(float[] data, int channels)
-        {
-            filterCalls++;
-            if (processor == null) return;
-            int frameLen = data.Length / channels;
-
-            // 1. 取通道 0 输入（播放率）
-            float[] pcmIn = new float[frameLen];
-            for (int i = 0; i < frameLen; i++) pcmIn[i] = data[i * channels];
-
-            // 诊断：输入 RMS
-            double inSq = 0;
-            for (int i = 0; i < frameLen; i++) inSq += pcmIn[i] * pcmIn[i];
-            float inRms = Mathf.Sqrt((float)(inSq / frameLen) + 1e-12f);
-
-            if (monitorBypass)
-            {
-                // 直出原始麦克风，用于隔离采集问题
-                float[] block0 = new float[frameLen];
-                for (int i = 0; i < frameLen; i++)
-                    for (int c = 0; c < channels; c++)
-                        data[i * channels + c] = pcmIn[i];
-                AccumDiag(inRms, inRms);
-                return;
-            }
-
-            // 2. 转模型率（如需）
-            float[] modelIn = needsResample ? inResampler.Resample(pcmIn) : pcmIn;
-
-            // 3. 入队并整 hop 处理
-            for (int i = 0; i < modelIn.Length; i++) inputQueue.Enqueue(modelIn[i]);
-            int hop = processor.HopLength;
-            var produced = new List<float>(modelIn.Length);
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            while (inputQueue.Count >= hop)
-            {
-                float[] hopBuf = new float[hop];
-                for (int i = 0; i < hop; i++) hopBuf[i] = inputQueue.Dequeue();
-                float[] enh;
+                var sw = System.Diagnostics.Stopwatch.StartNew();
                 try
                 {
-                    enh = processor.ProcessFrame(hopBuf);
+                    enh = processor.ProcessFrame(hop);
                 }
                 catch (Exception e)
                 {
@@ -162,51 +191,54 @@ namespace DPDFNetUnity
                         Debug.LogError($"[DPDFNet] 推理异常：{e.Message}");
                         loggedModelError = true;
                     }
-                    enh = hopBuf; // 异常时原样透传，避免静音
+                    enh = hop;         // 异常时原样透传，避免静音
                 }
-                for (int i = 0; i < hop; i++) produced.Add(enh[i]);
-            }
-            if (produced.Count > 0)
                 lastInferenceMs = (float)(sw.ElapsedTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
-
-            // 4. 转回播放率并入输出队列
-            float[] toOutput = produced.ToArray();
-            if (needsResample && toOutput.Length > 0)
-                toOutput = outResampler.Resample(toOutput);
-            for (int i = 0; i < toOutput.Length; i++) outputQueue.Enqueue(toOutput[i]);
-
-            // 5. 组装播放块 + 块级 AGC（对应 Python apply_output_agc）
-            float[] block = new float[frameLen];
-            for (int i = 0; i < frameLen; i++)
-            {
-                float enhanced = outputQueue.Count > 0 ? outputQueue.Dequeue() : (i > 0 ? block[i - 1] : 0f);
-                block[i] = (1f - playbackMix) * enhanced + playbackMix * pcmIn[i];
-            }
-            if (enableAgc)
-            {
-                double sumSq = 0;
-                for (int i = 0; i < frameLen; i++) sumSq += block[i] * block[i];
-                float rms = Mathf.Sqrt((float)(sumSq / frameLen) + 1e-12f);
-                const float targetRms = 0.12f, floor = 1e-3f, minGain = 0.25f, maxGain = 8f;
-                float desired = Mathf.Clamp(targetRms / Mathf.Max(rms, floor), minGain, maxGain);
-                agcGain = Mathf.Lerp(agcGain, desired, 0.1f);
-                for (int i = 0; i < frameLen; i++) block[i] = Mathf.Clamp(block[i] * agcGain, -1f, 1f);
-            }
-            else
-            {
-                for (int i = 0; i < frameLen; i++) block[i] = Mathf.Clamp(block[i], -1f, 1f);
             }
 
-            // 6. 写回（所有通道）
-            for (int i = 0; i < frameLen; i++)
-                for (int c = 0; c < channels; c++)
-                    data[i * channels + c] = block[i];
+            // 混合 + 块级 AGC（对应 Python apply_output_agc），结果写入 mixBuf。
+            float outRms;
+            lock (queueLock)
+            {
+                double mSq = 0;
+                for (int i = 0; i < hop.Length; i++)
+                {
+                    float v = (1f - playbackMix) * enh[i] + playbackMix * hop[i];
+                    mixBuf[i] = v;
+                    mSq += v * v;
+                }
+                float rms = (float)Math.Sqrt(mSq / hop.Length + 1e-12f);
+                if (enableAgc)
+                {
+                    const float targetRms = 0.12f, floor = 1e-3f, minGain = 0.25f, maxGain = 8f;
+                    float desired = Mathf.Clamp(targetRms / Mathf.Max(rms, floor), minGain, maxGain);
+                    agcGain = Mathf.Lerp(agcGain, desired, 0.05f);
+                    for (int i = 0; i < hop.Length; i++)
+                        mixBuf[i] = Mathf.Clamp(mixBuf[i] * agcGain, -1f, 1f);
+                    outRms = (float)Math.Sqrt((mSq * agcGain * agcGain) / hop.Length + 1e-12f);
+                }
+                else
+                {
+                    for (int i = 0; i < hop.Length; i++)
+                        mixBuf[i] = Mathf.Clamp(mixBuf[i], -1f, 1f);
+                    outRms = rms;
+                }
 
-            // 诊断：输出 RMS
-            double outSq = 0;
-            for (int i = 0; i < frameLen; i++) outSq += block[i] * block[i];
-            float outRms = Mathf.Sqrt((float)(outSq / frameLen) + 1e-12f);
+                for (int i = 0; i < hop.Length; i++) playbackQueue.Enqueue(mixBuf[i]);
+                while (playbackQueue.Count > MaxQueueSamples) playbackQueue.Dequeue(); // 溢出丢弃最旧
+            }
+
             AccumDiag(inRms, outRms);
+        }
+
+        // 由 Unity 音频线程调用，把增强样本供给 playClip。
+        private void OnAudioRead(float[] data)
+        {
+            lock (queueLock)
+            {
+                for (int i = 0; i < data.Length; i++)
+                    data[i] = playbackQueue.Count > 0 ? playbackQueue.Dequeue() : 0f;
+            }
         }
 
         private void AccumDiag(float inRms, float outRms)
@@ -223,7 +255,9 @@ namespace DPDFNetUnity
             {
                 float avgIn = inRmsSum / rmsFrames;
                 float avgOut = outRmsSum / rmsFrames;
-                Debug.Log($"[DPDFNet] calls={filterCalls} inRMS={avgIn:F4} outRMS={avgOut:F4} infer={lastInferenceMs:F2}ms needsResample={needsResample} qIn={inputQueue.Count} qOut={outputQueue.Count}");
+                int q;
+                lock (queueLock) q = playbackQueue.Count;
+                Debug.Log($"[DPDFNet] inRMS={avgIn:F4} outRMS={avgOut:F4} infer={lastInferenceMs:F2}ms bypass={monitorBypass} qPlay={q}");
                 inRmsSum = outRmsSum = 0f;
                 rmsFrames = 0;
                 diagTimer = 0f;
@@ -232,14 +266,18 @@ namespace DPDFNetUnity
 
         private void Cleanup()
         {
+            running = false;
+            StopAllCoroutines();
             if (micDevice != null && micClip != null && Microphone.IsRecording(micDevice))
                 Microphone.End(micDevice);
+            if (src != null && src.isPlaying) src.Stop();
             processor?.Dispose();
             processor = null;
             micDevice = null;
             micClip = null;
-            inputQueue.Clear();
-            outputQueue.Clear();
+            playClip = null;
+            pending.Clear();
+            lock (queueLock) playbackQueue.Clear();
         }
     }
 }

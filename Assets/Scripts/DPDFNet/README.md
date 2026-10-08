@@ -37,11 +37,12 @@ ONNX 模型位于 `Assets/StreamingAssets/dpdfnet/`，Unity 端逐帧执行：
 1. 在带 `AudioSource` 的 GameObject 上挂 `DpdfNetMicrophoneDemo`。
 2. Inspector 设置：
    - `Model Name`：`dpdfnet2`（或 baseline/dpdfnet4/dpdfnet8）。
-   - `Capture Sample Rate`：默认 `16000`（与模型一致；设备不支持时自动重采样）。
+   - `Capture Sample Rate`：默认 `16000`（与模型一致；Unity 会把麦克风重采样到该率写入 micClip）。
    - `Playback Mix`：`0`=纯增强，`1`=纯原始（用于对比）。
+   - `Monitor Bypass`：勾选则直出原始麦克风（跳过模型），用于隔离采集/播放问题。
    - `Enable Agc`：输出自动增益。
 3. **戴耳机**运行以避免啸叫。
-4. 运行日志会输出重采样信息、`lastInferenceMs`（单帧推理耗时，应远小于 10 ms @16k）。
+4. 运行日志会输出 `inRMS / outRMS / infer(ms) / qPlay`（播放队列长度）。单帧推理耗时 `infer` 应远小于 10 ms @16k。
 
 ## 关键移植点（与 Python 对齐）
 
@@ -55,9 +56,18 @@ ONNX 模型位于 `Assets/StreamingAssets/dpdfnet/`，Unity 端逐帧执行：
 | FFT | Math.NET `Forward`(不缩放) / `Inverse`(含 1/N)，等价 `np.fft.rfft/irfft` |
 | 流式 ISTFT | OLA，与 `real_time_demo.py` 完全一致 |
 
+## 实时架构说明（无 OnAudioFilterRead / 无自实现重采样）
+
+参考原工程 `real_time_demo.py` 的本质——**采集率 == 模型率 == 播放率（均为 16 kHz）**，因此全程不做重采样，从根上避免此前 `OnAudioFilterRead(data 处于 Unity 输出率)` 导致的采样率错位与队列漂移。
+
+- **采集**：`Microphone.Start(device, true, 1, 16000)` 直接以模型率录制；用 `Microphone.GetPosition` + `GetData` 轮询读取，带环绕安全处理，跨帧 leftover 续传（不丢样本）。
+- **增强**：每读到 `hop=160` 个 16k 样本即调用 `DpdfNetProcessor.ProcessFrame`，输出增强样本。
+- **播放**：增强样本写入一个 `Queue<float>` 环形队列；`AudioClip.Create(..., PCMReaderCallback)` 由 Unity 音频线程回调取数据，对应 `AudioSource` 播放该 clip。`PCMReaderCallback` 是 clip 的数据供给回调，并非 `OnAudioFilterRead`。
+- 采集与播放时钟同源（同一音频硬件、同为 16k），速率天然匹配，队列仅作平滑缓冲（上限 4s，溢出丢最旧）。
+
 ## 性能与扩展
 
 - `OnnxRuntimeSession` 已设单线程 + `ORT_ENABLE_ALL` 图优化，与 Python 一致。
 - `IOnnxSession` 抽象便于替换为 **Unity Sentis**（`com.unity.sentis` 包，导入 ONNX 后在 GPU/CPU 上推理，免去原生 DLL），适合 iOS/Android 发布。
-- 实时路径在 `OnAudioFilterRead` 内逐 hop 推理；若单帧耗时偏高，可改为双缓冲工作线程（生产/消费环形队列）。
+- 实时路径在 `DpdfNetMicrophoneDemo` 的协程（`CaptureLoop`）内逐 hop 推理；若单帧耗时偏高，可把推理移到独立工作线程（生产/消费环形队列，保持采集与播放分离）。
 - 离线处理文件：直接循环调用 `DpdfNetProcessor.ProcessFrame`，最后裁剪前 `n_fft*2` 个样本（对应 Python `postprocess_spec` 的尾零对齐）。
