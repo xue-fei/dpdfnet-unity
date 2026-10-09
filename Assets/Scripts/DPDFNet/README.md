@@ -78,11 +78,12 @@ ONNX 模型位于 `Assets/StreamingAssets/dpdfnet/`，Unity 端逐帧执行：
 - `OnnxRuntimeSession` 已设单线程 + `ORT_ENABLE_ALL` 图优化，与 Python 一致。
 - `IOnnxSession` 抽象便于替换为 **Unity Sentis**（`com.unity.sentis` 包，导入 ONNX 后在 GPU/CPU 上推理，免去原生 DLL），适合 iOS/Android 发布。
 - 实时路径在 `DpdfNetMicrophoneDemo` 的协程（`CaptureLoop`）内逐 hop 推理；若单帧耗时偏高，可把推理移到独立工作线程（生产/消费环形队列，保持采集与播放分离）。
-- 离线处理文件（流式路径，与 `real_time_demo.py` 的 `STFTStreamingPreprocess`/`ISTFTStreamingPostprocess` 一致）：逐 hop 调用 `DpdfNetProcessor.ProcessFrame`，**多处理 1 帧**（末帧用 0 补齐，把最后一帧真实输入的输出冲出延迟线），再裁掉前导 `hop` 个样本、取与输入**等长**的 `hop+L` 区间。流式 STFT 为因果结构，整体带一个 `hop` 的固定延迟（`out_0` 全 0、`out_k = x_{k-1}`），故输出长度与输入相同，仅整体后移约 10 ms@16k。
+- **实时路径**（`DpdfNetMicrophoneDemo`）：因果流式 STFT/ISTFT，对应 `real_time_demo.py` 的 `STFTStreamingPreprocess`/`ISTFTStreamingPostprocess`，带一个 `hop` 固定延迟（`out_0` 全 0、`out_k = x_{k-1}`）。
+- **离线文件路径**（`DpdfNetFileExample`）：与源码 `onnx_model/infer_dpdfnet_onnx.py` 的 `enhance_file_onnx` 逐行对齐——`center=True` 反射填充 STFT → 流式 ONNX(state) → `center=True` ISTFT（win² 归一化 OLA，两端裁 `n_fft/2`）→ `postprocess_spec`（裁 `win_len*2`/补 `win_len*2`）→ `fit_length`。**两条路径帧对齐与边界处理不同，结果不可互换**；文件处理以 `infer_dpdfnet_onnx` 为准。
 
 ## 16 kHz 音频文件处理示例
 
-`DpdfNetFileExample.cs` 提供一行式离线降噪：读取 16 kHz WAV → 逐 hop 调 `DpdfNetProcessor.ProcessFrame` → 写回增强后的 WAV。仅依赖 onnxruntime 包，自带极简 `WavIo`（读 PCM 16/24/32-bit、float；写 16-bit PCM），无需 NAudio 等额外依赖。
+`DpdfNetFileExample.cs` 提供一行式离线降噪：读取 16 kHz WAV → 按源码 `infer_dpdfnet_onnx.enhance_file_onnx`（`center=True` 反射填充 STFT + 流式 ONNX + `center=True` ISTFT + `postprocess_spec`）处理 → 写回增强后的 WAV。仅依赖 onnxruntime 包，自带极简 `WavIo`（读 PCM 16/24/32-bit、float；写 16-bit PCM），无需 NAudio / librosa 等额外依赖。
 
 ### 用法
 
@@ -98,15 +99,15 @@ string modelPath = System.IO.Path.Combine(Application.streamingAssetsPath, "dpdf
 DPDFNetUnity.DpdfNetFileExample.ProcessWav(modelPath, inputWav, outputWav);
 ```
 
-### 关键逻辑（与 Python 离线路径对齐）
+### 关键逻辑（逐行对齐 Python `infer_dpdfnet_onnx.enhance_file_onnx`）
 
 1. **读取**：`WavIo.TryRead` 把任意声道/位深转成单声道 `float[]`（归一化到 [-1,1]）；非 16 kHz 文件会告警（模型是 16k 训练的，建议先重采样）。
-2. **建处理器**：`new OnnxRuntimeSession(modelPath)` → `DpdfNetModelConfig.FromSession` → `new DpdfNetProcessor(cfg, session)`（处理器负责释放 session）。
-3. **逐 hop 处理**：以 `hop=160` 为步长切片，共处理 `M+1` 帧（`M = ceil(L/hop)`，末帧用 0 补齐）。多出的 1 帧用于把最后一帧真实输入的输出冲出延迟线（流式 STFT 因果，每帧输出对应「上一帧输入」）。
-4. **裁边对齐**：裁掉前导 `hop`（首帧输出全 0），取 `outBuf[hop : hop+L]`；得到与原始输入**完全等长**（L 样本）的结果。输出整体延迟一个 `hop`（约 10 ms@16k），这是因果流式结构的固有延迟，非长度丢失。
-5. **写回**：`WavIo.Write` 输出 16 kHz 单声道 16-bit PCM。
+2. **建 session**：`new OnnxRuntimeSession(modelPath)` → `DpdfNetModelConfig.FromSession`（`using` 释放 session）。
+3. **末端补 `win_len` + `center=True` 反射填充 `n_fft/2`**：对应 `np.pad(waveform,(0,win_len))` 与 librosa `pad_mode='reflect'`。
+4. **center STFT + 流式 ONNX + center ISTFT**：逐帧 `rfft(win*frame)`，state 逐帧回传（`BuildInitialState` 起始）；`irfft*win` 后 win² 归一化 OLA，两端裁 `n_fft/2`（librosa `istft(center=True)`）。
+5. **`postprocess_spec` + `fit_length`**：裁掉前 `win_len*2`、末尾补 `win_len*2` 个 0，再裁/补到原始长度 L。`win_len*2` 的裁剪抵消模型内部 ~4 hop 的延迟（CyclicBuffer），故输出与输入对齐。
 
 ### 平台注意
 
 - **Android / iOS**：`StreamingAssets` 在打包后位于 APK/IPA 内，无法以文件系统路径直接读取。需先把模型/音频拷贝到 `Application.persistentDataPath`（可读写），再传入 `ProcessWav`。
-- 示例 `WavIo` 仅覆盖常见格式且多声道写入简化（仅填第 0 声道）。生产环境可替换为 NAudio 或 Unity `AudioClip` 导入，但核心处理流程（`DpdfNetProcessor` 调用）不变。
+- 示例 `WavIo` 仅覆盖常见格式且多声道写入简化（仅填第 0 声道）。生产环境可替换为 NAudio 或 Unity `AudioClip` 导入，但核心处理流程（离线 STFT → ONNX → ISTFT）不变。

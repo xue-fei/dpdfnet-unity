@@ -1,15 +1,20 @@
 using System;
 using System.IO;
+using System.Numerics;
+using MathNet.Numerics.IntegralTransforms;
 using UnityEngine;
 
 namespace DPDFNetUnity
 {
     /// <summary>
     /// 16 kHz 音频文件离线降噪示例（不依赖任何额外包，仅需 onnxruntime 包）。
-    /// 流程：读取 WAV -> 逐 hop 调 DpdfNetProcessor.ProcessFrame -> 写回增强后的 WAV。
+    /// 严格对齐 DPDFNet 源码 onnx_model/infer_dpdfnet_onnx.py 的 enhance_file_onnx：
+    ///   center=True 反射填充 STFT -> 流式 ONNX(state) -> center=True ISTFT(win^2 归一化)
+    ///   -> postprocess_spec(裁 win_len*2 / 补 win_len*2) -> fit_length。
+    /// 与「实时」路径（real_time_demo.py 的因果流式 STFT）不同：文件离线用 librosa 的
+    /// center=True 算法，逐帧对齐与边界处理都不一样，故结果以源码为准。
     /// 适用于桌面 / Editor 下以本地文件路径处理；移动端请将模型与音频放在可读写路径
-    /// （如 Application.persistentDataPath），因 StreamingAssets 在 Android 内打包为 APK
-    /// 资源，InferenceSession 无法直接以路径读取。
+    /// （如 Application.persistentDataPath），因 StreamingAssets 在 Android 内打包为 APK 资源。
     /// </summary>
     public class DpdfNetFileExample : MonoBehaviour
     {
@@ -36,45 +41,139 @@ namespace DPDFNetUnity
             if (sampleRate != 16000)
                 Debug.LogWarning($"[DPDFNet] 输入采样率为 {sampleRate} Hz，DPDFNet 模型为 16 kHz 训练，建议先重采样到 16000 再处理（此处按原率处理，结果可能异常）。");
 
-            // 2) 加载模型并建立处理器（DpdfNetProcessor 负责释放 session）
-            var session = new OnnxRuntimeSession(modelPath);
+            // 2) 加载模型（using 释放，替代原先经 DpdfNetProcessor.Dispose 释放）
+            using var session = new OnnxRuntimeSession(modelPath);
             var cfg = DpdfNetModelConfig.FromSession(session);
-            using var proc = new DpdfNetProcessor(cfg, session);
 
-            int hop = proc.HopLength;
+            // 3) 离线增强（严格对齐 infer_dpdfnet_onnx.enhance_file_onnx）
+            float[] enhanced = EnhanceOffline(samples, session, cfg);
 
-            // 3) 逐 hop 处理。流式 STFT/ISTFT 为因果结构（对应 Python
-            //    real_time_demo.py 的 STFTStreamingPreprocess / ISTFTStreamingPostprocess）：
-            //    每帧输出是「上一帧输入」的增强结果，即整体带一个 hop 的固定延迟
-            //    （out_0 全 0，out_k = x_{k-1}）。因此：
-            //    - 末尾需多处理 1 帧（用 0 补齐），把最后一帧真实输入的输出冲出延迟线；
-            //    - 裁掉前导 hop（首帧的 0）后，取与原始输入等长的 hop+L 区间。
-            int frames = (samples.Length + hop - 1) / hop;   // 输入帧数 M = ceil(L/hop)
-            int outFrames = frames + 1;                       // 多 1 帧用于 flush 最后一段
-            int outLen = outFrames * hop;
-            float[] outBuf = new float[outLen];
+            // 4) 写回 WAV（16 kHz 单声道 16-bit PCM）
+            WavIo.Write(outputWav, enhanced, 16000, 1);
+            Debug.Log($"[DPDFNet] 已处理 {samples.Length} 样本 -> {outputWav}");
+        }
 
-            for (int f = 0; f < outFrames; f++)
+        /// <summary>
+        /// 离线增强，逐行对应 infer_dpdfnet_onnx.enhance_file_onnx（attn_limit 缺省关闭）：
+        ///   末端补 win_len -> center=True 反射填充 STFT -> 流式 ONNX(state) ->
+        ///   center=True ISTFT(win^2 归一化 OLA, 两端裁 n_fft/2) ->
+        ///   postprocess_spec(裁 win_len*2, 补 win_len*2) -> fit_length。
+        /// </summary>
+        static float[] EnhanceOffline(float[] x, IOnnxSession session, DpdfNetModelConfig cfg)
+        {
+            int nFft = cfg.n_fft;            // 320
+            int hop = cfg.hop_length;        // 160
+            int winLen = cfg.window_length;  // 320
+            float[] win = VorbisWindow.Compute(winLen);
+            int half = nFft / 2;
+
+            // 1) 末端补 win_len 个 0：np.pad(waveform, (0, win_len), mode='constant')
+            int L = x.Length;
+            float[] xpad = new float[L + winLen];
+            Array.Copy(x, 0, xpad, 0, L);
+
+            // 2) center=True 反射填充 n_fft//2（librosa pad_mode='reflect'）
+            float[] xp = ReflectPad(xpad, half);
+
+            // 3) center=True 分帧 STFT（librosa.stft，逐帧 rfft）
+            int numFrames = 1 + (xp.Length - nFft) / hop;
+            var specRI = new float[numFrames][];
+            for (int t = 0; t < numFrames; t++)
             {
-                float[] hopIn = new float[hop];
-                int src = f * hop;
-                int n = Math.Min(hop, samples.Length - src);
-                if (n > 0) Array.Copy(samples, src, hopIn, 0, n); // 越界部分默认 0（末帧 flush）
-
-                float[] hopOut = proc.ProcessFrame(hopIn);
-                Array.Copy(hopOut, 0, outBuf, f * hop, hop);
+                var frame = new float[nFft];
+                int off = t * hop;
+                for (int i = 0; i < nFft; i++) frame[i] = xp[off + i] * win[i];
+                specRI[t] = Rfft(frame);
             }
 
-            // 4) 裁掉前导 hop（流式 ISTFT 首帧为全 0），取与原始输入等长的部分，
-            //    得到与原始输入【完全等长】的干净结果（仅整体延迟一个 hop，约 10 ms@16k）。
-            int frontTrim = hop;
-            int cleanLen = samples.Length;
-            float[] clean = new float[cleanLen];
-            Array.Copy(outBuf, frontTrim, clean, 0, cleanLen);
+            // 4) 流式 ONNX（state 逐帧回传，对应 run_onnx_streaming）
+            float[] state = cfg.BuildInitialState();
+            var specE = new float[numFrames][];
+            for (int t = 0; t < numFrames; t++)
+            {
+                session.Run(specRI[t], state, out var se, out var st);
+                specE[t] = se;
+                state = st;
+            }
 
-            // 5) 写回 WAV（16 kHz 单声道 16-bit PCM）
-            WavIo.Write(outputWav, clean, 16000, 1);
-            Debug.Log($"[DPDFNet] 已处理 {samples.Length} 样本 -> {outputWav}");
+            // 5) center=True ISTFT（librosa.istft）：win^2 归一化 OLA，再两端裁 n_fft//2
+            int expected = nFft + hop * (numFrames - 1);
+            float[] y = new float[expected];
+            float[] winSum = new float[expected];
+            for (int t = 0; t < numFrames; t++)
+            {
+                float[] td = Irfft(specE[t], nFft);
+                int off = t * hop;
+                for (int i = 0; i < nFft; i++)
+                {
+                    y[off + i] += td[i] * win[i];
+                    winSum[off + i] += win[i] * win[i];
+                }
+            }
+            for (int i = 0; i < expected; i++)
+                y[i] = winSum[i] > 1e-12f ? y[i] / winSum[i] : 0f;
+
+            int waveELen = expected - 2 * half;
+            float[] waveE = new float[waveELen];
+            Array.Copy(y, half, waveE, 0, waveELen);
+
+            // 6) postprocess_spec：裁掉前 win_len*2，末尾补 win_len*2 个 0（长度不变）
+            int drop = winLen * 2;
+            float[] post = new float[waveELen];
+            if (waveELen > drop)
+                Array.Copy(waveE, drop, post, 0, waveELen - drop);
+            // 末尾 drop 个 0 由零初始化
+
+            // 7) fit_length：对齐到原始长度
+            float[] outArr = new float[L];
+            int copyLen = Math.Min(L, post.Length);
+            Array.Copy(post, 0, outArr, 0, copyLen);
+            return outArr;
+        }
+
+        /// <summary>np.pad(x, pad, mode='reflect')：不含边缘重复的对称反射填充。</summary>
+        static float[] ReflectPad(float[] x, int pad)
+        {
+            if (pad <= 0) return (float[])x.Clone();
+            int L = x.Length;
+            float[] r = new float[L + 2 * pad];
+            for (int i = 0; i < L; i++) r[pad + i] = x[i];
+            for (int i = 0; i < pad; i++) r[i] = x[pad - i];             // x[pad]..x[1]
+            for (int i = 0; i < pad; i++) r[pad + L + i] = x[L - 2 - i]; // x[L-2]..x[L-1-pad]
+            return r;
+        }
+
+        /// <summary>numpy.fft.rfft：前向不缩放，返回 [F*2] 交错 real/imag。</summary>
+        static float[] Rfft(float[] x)
+        {
+            int n = x.Length;
+            var buf = new Complex[n];
+            for (int i = 0; i < n; i++) buf[i] = new Complex(x[i], 0.0);
+            Fourier.Forward(buf, FourierOptions.Default);
+            int F = n / 2 + 1;
+            float[] ri = new float[F * 2];
+            for (int f = 0; f < F; f++)
+            {
+                ri[f * 2] = (float)buf[f].Real;
+                ri[f * 2 + 1] = (float)buf[f].Imaginary;
+            }
+            return ri;
+        }
+
+        /// <summary>numpy.fft.irfft：逆变换含 1/N，由 [F*2] 交错重建 n 点实信号。</summary>
+        static float[] Irfft(float[] specRI, int n)
+        {
+            int F = n / 2 + 1;
+            var full = new Complex[n];
+            for (int f = 0; f < F; f++) full[f] = new Complex(specRI[f * 2], specRI[f * 2 + 1]);
+            full[0] = new Complex(full[0].Real, 0.0);
+            full[F - 1] = new Complex(full[F - 1].Real, 0.0);
+            for (int k = 1; k < F - 1; k++)
+                full[n - k] = new Complex(full[k].Real, -full[k].Imaginary);
+            Fourier.Inverse(full, FourierOptions.Default);
+            float[] td = new float[n];
+            for (int i = 0; i < n; i++) td[i] = (float)full[i].Real;
+            return td;
         }
     }
 
