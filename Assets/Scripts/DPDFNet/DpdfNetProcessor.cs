@@ -82,60 +82,164 @@ namespace DPDFNetUnity
     }
 
     /// <summary>
-    /// DPDFNet 流式降噪核心：每帧 串/并联 STFT -> ONNX(state 进/出) -> ISTFT。
-    /// 与 Python real_time_demo.enhance_frame 完全对应。
-    /// 复用内部缓冲区，适合在音频线程逐帧调用。
+    /// DPDFNet 流式降噪核心，严格对齐 Python 官方流式 API
+    /// `DPDFNet/package/src/dpdfnet/stream.py` 的 <c>StreamEnhancer</c>：
+    ///
+    /// - <see cref="Process"/>：送入任意长度的 16 kHz 单声道样本块。内部维护
+    ///   win_len 输入帧缓冲 + OLA 输出缓冲，凑满一整窗（win_len=320）才推理一帧，
+    ///   每帧提交 hop（160）个增强样本。返回值为本次已提交的增强样本（hop 的整数倍，
+    ///   可能为空——首窗未满 win_len 前无输出，即约一个窗 20ms 的固定延迟）。
+    /// - <see cref="Flush"/>：流结束时排空尾部——把不足一窗的余量补零凑整窗再处理
+    ///   一帧，返回最后至多 hop 个增强样本（不重置状态）。
+    /// - <see cref="Reset"/>：重置 RNN state 与内部缓冲；独立音频段之间调用，
+    ///   防止 state 跨流泄漏。
+    ///
+    /// 与 Python 逐帧对应：windowed = in_buf[:win_len] * window → rfft → ONNX(state 进/出)
+    /// → irfft * window → OLA（Vorbis 窗满足 w[n]² + w[n+hop]² = 1，50% 重叠 COLA，
+    /// 每帧后前 hop 个样本已完全重建）。输入须为模型率（16 kHz）单声道；
+    /// 该 C# 移植不做 stream.py 中的重采样（工程内采集/播放/模型率统一 16k）。
+    /// 注意：此因果路径与离线 enhance（center=True）非逐位一致，见 stream.py docstring。
     /// </summary>
     public class DpdfNetProcessor : IDisposable
     {
         private readonly DpdfNetModelConfig cfg;
         private readonly IOnnxSession session;
-        private readonly StreamingStft stft;
-        private readonly StreamingIstft istft;
+        private readonly float[] window;
+        private readonly int winLen;
+        private readonly int hop;
+
         private float[] state;
-        private readonly float[] specBuf;
-        private readonly float[] outHop;
+
+        // 输入帧缓冲（StreamEnhancer._in_buf）：只增不减容量，逐帧左移消耗。
+        private float[] inBuf = Array.Empty<float>();
+        private int inLen;
+
+        // OLA 输出缓冲（StreamEnhancer._out_buf），长度 win_len。
+        private readonly float[] outBuf;
+
+        // 逐帧 scratch（复用，避免每帧分配）。
+        private readonly float[] specBuf;   // [freq_bins*2] 交错 real/imag
+        private readonly float[] windowed;  // [win_len] 加窗帧
+        private readonly float[] timeFrame; // [win_len] irfft 时域帧
+        private readonly System.Numerics.Complex[] fftScratch;
+
         private readonly object lockObj = new object();
 
-        public int HopLength => cfg.hop_length;
+        public int HopLength => hop;
         public int SampleRate => cfg.sample_rate;
+        public int WindowLength => winLen;
 
         public DpdfNetProcessor(DpdfNetModelConfig cfg, IOnnxSession session)
         {
             this.cfg = cfg ?? throw new ArgumentNullException(nameof(cfg));
             this.session = session ?? throw new ArgumentNullException(nameof(session));
-            float[] window = VorbisWindow.Compute(cfg.window_length);
-            stft = new StreamingStft(cfg.n_fft, cfg.hop_length, window);
-            istft = new StreamingIstft(cfg.n_fft, cfg.hop_length, window);
-            state = cfg.BuildInitialState();
+            winLen = cfg.window_length;
+            hop = cfg.hop_length;
+            window = VorbisWindow.Compute(winLen);
+            outBuf = new float[winLen];
             specBuf = new float[cfg.freq_bins * 2];
-            outHop = new float[cfg.hop_length];
+            windowed = new float[winLen];
+            timeFrame = new float[winLen];
+            fftScratch = new System.Numerics.Complex[winLen];
+            state = cfg.BuildInitialState();
         }
 
-        /// <summary>处理一个 hop 的噪声样本，返回增强后的 hop（同一数组实例，调用方需立即使用）。</summary>
-        public float[] ProcessFrame(float[] noisyHop)
+        /// <summary>
+        /// 处理任意长度的音频块，返回本次已提交的增强样本（hop 的整数倍，可能为空）。
+        /// 对应 StreamEnhancer.process()：内部按 win_len 凑窗逐帧推理，
+        /// 返回数组为新分配实例，调用方可长期持有。
+        /// </summary>
+        public float[] Process(float[] chunk)
         {
+            if (chunk == null) throw new ArgumentNullException(nameof(chunk));
             lock (lockObj)
             {
-                stft.Process(noisyHop, specBuf);
-                session.Run(specBuf, state, out var specOut, out var stateOut);
-                state = stateOut;
-                istft.Process(specOut, outHop);
-                return outHop;
+                return ProcessCore(chunk);
             }
         }
 
-        /// <summary>重置流式状态（静音间隙/切换模型时调用）。</summary>
+        /// <summary>
+        /// 流结束时排空尾部：余量补零凑整窗再处理一帧，返回最后至多 hop 个增强样本。
+        /// 对应 StreamEnhancer.flush()；不重置状态，换新流前请显式 <see cref="Reset"/>。
+        /// </summary>
+        public float[] Flush()
+        {
+            lock (lockObj)
+            {
+                if (inLen == 0) return Array.Empty<float>();
+
+                // 补零到整窗（StreamEnhancer: pad = zeros(win_len - remainder)）
+                float[] pad = new float[winLen - inLen];
+                float[] outSamps = ProcessCore(pad);
+
+                // 只保留真实输入对应的输出：一个 hop 的真实音频对应一个 hop 的输出。
+                int realOut = Math.Min(hop, outSamps.Length);
+                float[] trimmed = new float[realOut];
+                Array.Copy(outSamps, 0, trimmed, 0, realOut);
+                return trimmed;
+            }
+        }
+
+        /// <summary>重置流式状态（RNN state + 输入/输出缓冲）。静音间隙或切换音频段时调用。</summary>
         public void Reset()
         {
             lock (lockObj)
             {
                 state = cfg.BuildInitialState();
-                stft.Reset();
-                istft.Reset();
+                inLen = 0;
+                Array.Clear(outBuf, 0, outBuf.Length);
             }
         }
 
         public void Dispose() => session?.Dispose();
+
+        // ---- 内部实现（须在 lockObj 内调用）----
+
+        private float[] ProcessCore(float[] chunk)
+        {
+            if (chunk.Length == 0) return Array.Empty<float>();
+
+            // in_buf = concat(in_buf, chunk)
+            int need = inLen + chunk.Length;
+            if (inBuf.Length < need)
+                Array.Resize(ref inBuf, Math.Max(need, Math.Max(winLen * 2, inBuf.Length * 2)));
+            Array.Copy(chunk, 0, inBuf, inLen, chunk.Length);
+            inLen = need;
+
+            // 每凑满 win_len 处理一帧，提交 hop 个样本。
+            int frames = inLen >= winLen ? (inLen - winLen) / hop + 1 : 0;
+            float[] outSamps = new float[frames * hop];
+            int outPos = 0;
+
+            while (inLen >= winLen)
+            {
+                // --- 分析 STFT（causal / center=False）：windowed = in_buf[:win_len] * window ---
+                for (int i = 0; i < winLen; i++)
+                    windowed[i] = inBuf[i] * window[i];
+                StftMath.Rfft(windowed, winLen, fftScratch, specBuf);
+
+                // --- ONNX 推理（state 逐帧进/出回传） ---
+                session.Run(specBuf, state, out var specOut, out var stateOut);
+                state = stateOut;
+
+                // --- 每帧 ISTFT + 重叠相加：out_buf += irfft(spec_e) * window ---
+                StftMath.Irfft(specOut, winLen, fftScratch, timeFrame);
+                for (int i = 0; i < winLen; i++)
+                    outBuf[i] += timeFrame[i] * window[i];
+
+                // Vorbis 窗满足 50% 重叠 COLA（w[n]² + w[n+hop]² == 1），
+                // 故每帧后前 hop 个样本已完全重建，可以提交。
+                Array.Copy(outBuf, 0, outSamps, outPos, hop);
+                outPos += hop;
+
+                // out_buf 左移 hop、尾部清零；in_buf 消耗 hop。
+                Array.Copy(outBuf, hop, outBuf, 0, winLen - hop);
+                Array.Clear(outBuf, winLen - hop, hop);
+                Array.Copy(inBuf, hop, inBuf, 0, inLen - hop);
+                inLen -= hop;
+            }
+
+            return outSamps;
+        }
     }
 }

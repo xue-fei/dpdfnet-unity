@@ -7,8 +7,8 @@ namespace DPDFNetUnity
 {
     /// <summary>
     /// Vorbis（Tremolo）分析/合成窗，满足 Princen-Bradley 条件：
-    /// 同一窗用于分析与合成时完美重建。
-    /// 与 Python vorbis_window 逐元素一致。
+    /// 同一窗用于分析与合成时完美重建（w[n]^2 + w[n+hop]^2 == 1，50% 重叠）。
+    /// 与 Python vorbis_window / make_stft_config 逐元素一致。
     /// </summary>
     public static class VorbisWindow
     {
@@ -26,106 +26,69 @@ namespace DPDFNetUnity
     }
 
     /// <summary>
-    /// 流式 STFT 预处理，对应 Python STFTStreamingPreprocess。
-    /// 每送入 hop_size 个单声道样本，产出 [freq_bins*2] 交错（real,imag）频谱。
+    /// STFT/ISTFT 数学核，等价 numpy.fft.rfft / numpy.fft.irfft：
+    /// Math.NET Fourier.Forward(Default) 不缩放 = np.fft.rfft；
+    /// Fourier.Inverse(Default) 含 1/N = np.fft.irfft（DC/Nyquist 虚部按 numpy 语义置 0）。
+    /// 提供「scratch 复用」无分配版与便捷分配版两组重载，供流式处理器与离线示例共用。
     /// </summary>
-    public class StreamingStft
+    public static class StftMath
     {
-        private readonly int winLen;
-        private readonly int hopSize;
-        private readonly float[] window;
-        private readonly float[] buffer;
-        private readonly Complex[] fftBuf;
-
-        public StreamingStft(int winLen, int hopSize, float[] window)
+        /// <summary>
+        /// x[0..n) -> outRI[(n/2+1)*2] 交错（real, imag），前向不缩放。
+        /// scratch.Length 必须 == n（Math.NET 对整数组做变换），用作工作区避免逐帧分配。
+        /// </summary>
+        public static void Rfft(float[] x, int n, Complex[] scratch, float[] outRI)
         {
-            this.winLen = winLen;
-            this.hopSize = hopSize;
-            this.window = window;
-            this.buffer = new float[winLen];
-            this.fftBuf = new Complex[winLen];
-        }
+            for (int i = 0; i < n; i++)
+                scratch[i] = new Complex(x[i], 0.0);
 
-        public void Reset() => Array.Clear(buffer, 0, buffer.Length);
+            Fourier.Forward(scratch, FourierOptions.Default);
 
-        public void Process(float[] hop, float[] outSpecRI)
-        {
-            if (hop.Length != hopSize)
-                throw new ArgumentException($"expected {hopSize} samples, got {hop.Length}");
-
-            // buffer = concat(buffer[hop:], hop)
-            Array.Copy(buffer, hopSize, buffer, 0, winLen - hopSize);
-            Array.Copy(hop, 0, buffer, winLen - hopSize, hopSize);
-
-            for (int i = 0; i < winLen; i++)
-                fftBuf[i] = new Complex(buffer[i] * window[i], 0.0);
-
-            // numpy.fft.rfft 不缩放；Math.NET Forward(Default) 同样不缩放。
-            Fourier.Forward(fftBuf, FourierOptions.Default);
-
-            int freq = winLen / 2 + 1;
+            int freq = n / 2 + 1;
             for (int f = 0; f < freq; f++)
             {
-                outSpecRI[f * 2] = (float)fftBuf[f].Real;
-                outSpecRI[f * 2 + 1] = (float)fftBuf[f].Imaginary;
+                outRI[f * 2] = (float)scratch[f].Real;
+                outRI[f * 2 + 1] = (float)scratch[f].Imaginary;
             }
         }
-    }
 
-    /// <summary>
-    /// 流式 ISTFT 后处理（重叠相加），对应 Python ISTFTStreamingPostprocess。
-    /// 输入 [freq_bins*2] 交错（real,imag），输出 hop_size 个时域样本。
-    /// </summary>
-    public class StreamingIstft
-    {
-        private readonly int winLen;
-        private readonly int hopSize;
-        private readonly float[] window;
-        private readonly Complex[] full;
-        private readonly float[] newBuf;
-        private float[] olaBuffer;
-
-        public StreamingIstft(int winLen, int hopSize, float[] window)
+        /// <summary>
+        /// specRI[(n/2+1)*2] 交错 -> out[0..n)，逆变换含 1/N。
+        /// 由 [freq] 半谱重建 Hermitian 对称全谱；DC 与 Nyquist 虚部置 0（与 numpy.irfft 一致，
+        /// 保证输出纯实数）。scratch.Length 必须 == n。
+        /// </summary>
+        public static void Irfft(float[] specRI, int n, Complex[] scratch, float[] outTime)
         {
-            this.winLen = winLen;
-            this.hopSize = hopSize;
-            this.window = window;
-            this.full = new Complex[winLen];
-            this.newBuf = new float[winLen];
-            this.olaBuffer = new float[winLen];
-        }
-
-        public void Reset() => Array.Clear(olaBuffer, 0, olaBuffer.Length);
-
-        public void Process(float[] specRI, float[] outHop)
-        {
-            int freq = winLen / 2 + 1;
-
-            // 由 [freq] 复频谱重建 Hermitian 对称的全频谱。
+            int freq = n / 2 + 1;
             for (int f = 0; f < freq; f++)
-                full[f] = new Complex(specRI[f * 2], specRI[f * 2 + 1]);
-            // DC 与 Nyquist 必须为实数，保证输出纯实数（与 numpy.irfft 一致）。
-            full[0] = new Complex(full[0].Real, 0.0);
-            full[freq - 1] = new Complex(full[freq - 1].Real, 0.0);
+                scratch[f] = new Complex(specRI[f * 2], specRI[f * 2 + 1]);
+
+            scratch[0] = new Complex(scratch[0].Real, 0.0);
+            scratch[freq - 1] = new Complex(scratch[freq - 1].Real, 0.0);
             for (int k = 1; k < freq - 1; k++)
-                full[winLen - k] = new Complex(full[k].Real, -full[k].Imaginary);
+                scratch[n - k] = new Complex(scratch[k].Real, -scratch[k].Imaginary);
 
-            // numpy.fft.irfft 含 1/N；Math.NET Inverse(Default) 同样含 1/N。
-            Fourier.Inverse(full, FourierOptions.Default);
+            Fourier.Inverse(scratch, FourierOptions.Default);
 
-            for (int i = 0; i < winLen; i++)
-            {
-                float sample = (float)full[i].Real * window[i];
-                if (i < winLen - hopSize)
-                    newBuf[i] = olaBuffer[hopSize + i] + sample;
-                else
-                    newBuf[i] = sample; // 后半段为 0，无需相加
-            }
+            for (int i = 0; i < n; i++)
+                outTime[i] = (float)scratch[i].Real;
+        }
 
-            for (int i = 0; i < hopSize; i++)
-                outHop[i] = newBuf[i];
-            // 将完整 OLA 缓冲复制回 olaBuffer（newBuf 为复用 scratch，不可直接交换）
-            Array.Copy(newBuf, 0, olaBuffer, 0, winLen);
+        /// <summary>便捷版：x -> [F*2] 交错 real/imag（内部临时分配，适合离线逐帧调用）。</summary>
+        public static float[] Rfft(float[] x)
+        {
+            int n = x.Length;
+            var outRI = new float[(n / 2 + 1) * 2];
+            Rfft(x, n, new Complex[n], outRI);
+            return outRI;
+        }
+
+        /// <summary>便捷版：[F*2] 交错 -> n 点实信号（内部临时分配，适合离线逐帧调用）。</summary>
+        public static float[] Irfft(float[] specRI, int n)
+        {
+            var outTime = new float[n];
+            Irfft(specRI, n, new Complex[n], outTime);
+            return outTime;
         }
     }
 }

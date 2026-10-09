@@ -13,10 +13,12 @@ namespace DPDFNetUnity
     /// 因此全程不需要重采样，也不存在此前 OnAudioFilterRead(data 处于输出率) 导致的采样率错位与队列漂移。
     ///
     /// 管线：
-    ///   麦克风(16000) --Microphone.GetData 逐帧--> DPDFNetProcessor.ProcessFrame(hop=160)
+    ///   麦克风(16000) --Microphone.GetData 逐帧--> DPDFNetProcessor.Process(hop=160)
     ///        --> 增强样本入播放环形队列 --> PCMReaderCallback 喂给 playClip --> AudioSource 播放。
     ///
     /// 说明：
+    ///   - DPDFNetProcessor 对齐 Python stream.py 的 StreamEnhancer：win_len 帧缓冲，
+    ///     首窗未满（~20ms）无输出，之后每次调用返回 1 个 hop 的增强样本（可变长，可能为空）。
     ///   - 用 Microphone.GetData 轮询读取（带环绕安全处理 + 跨帧 leftover 续传，不丢样本）。
     ///   - 播放通过 AudioClip.Create 的 PCMReaderCallback 提供数据，AudioSource 直接播放该 clip。
     ///     PCMReaderCallback 是 clip 的数据供给回调，并非 OnAudioFilterRead。
@@ -65,10 +67,13 @@ namespace DPDFNetUnity
         private float agcGain = 1f;
 
         // —— 后台推理（Loom）相关 ——
-        // DPDFNet 是 stateful 流式模型：state 必须逐帧串行传递，且 ProcessFrame 复用同一个
-        // outHop 数组返回。因此用 inferLock 把「推理 + 立即拷走结果」包成原子，既保证帧顺序
-        // 不被并发打乱，也避免复用缓冲被下一帧覆盖。
+        // DPDFNet 是 stateful 流式模型：state 必须逐帧串行传递，且 Process 内部维护
+        // win_len 输入帧缓冲（StreamEnhancer 语义）。用 inferLock 把「推理 + 原始样本
+        // 对齐出队」包成原子，既保证帧顺序不被并发打乱，也保证 rawDelay 队列一致性。
         private readonly object inferLock = new object();
+        // 原始样本对齐队列：输出流是输入流的延迟镜像（输出样本 m ↔ 输入样本 m），
+        // Process 每吐出 N 个增强样本，就从队头取 N 个原始样本与之配对（供 playbackMix）。
+        private readonly Queue<float> rawDelay = new Queue<float>();
         private int inflight;                       // 在途推理任务数（背压计数）
         private const int MaxInflight = 2;          // 背压上限：超过则丢弃本帧
         private int droppedFrames;                  // 诊断：因背压丢弃的帧数
@@ -127,6 +132,7 @@ namespace DPDFNetUnity
 
             micPrevPos = 0;
             pending.Clear();
+            lock (inferLock) rawDelay.Clear();
             lock (queueLock) playbackQueue.Clear();
             running = true;
             StartCoroutine(CaptureLoop());
@@ -207,25 +213,31 @@ namespace DPDFNetUnity
         }
 
         /// <summary>
-        /// 后台线程：调用 ONNX 推理。用 inferLock 把「推理 + 立即拷走结果」包成原子——
-        /// 保证流式 state 的帧顺序（stateful 模型必须逐帧串行），并避免复用的 outHop
-        /// 被并发改写。推理耗时测好后再回主线程落地。
+        /// 后台线程：调用 ONNX 推理。用 inferLock 把「推理 + 原始样本对齐出队」包成原子——
+        /// 保证流式 state 的帧顺序（stateful 模型必须逐帧串行），并保证 rawDelay 队列一致。
+        /// DpdfNetProcessor.Process 为 StreamEnhancer 语义：返回本次已提交的增强样本
+        /// （hop 的整数倍，首窗未满时为空），输出样本 m 与输入样本 m 一一对应（延迟镜像），
+        /// 故增强结果与 rawDelay 队头的原始样本严格对齐。推理耗时测好后再回主线程落地。
         /// </summary>
         private void DoInfer(float[] hop, float inRms)
         {
             var sw = System.Diagnostics.Stopwatch.StartNew();
             try
             {
-                float[] local;
+                float[] enh;
+                float[] rawAligned;
                 lock (inferLock)
                 {
-                    float[] enh = processor.ProcessFrame(hop);   // 返回复用的 outHop 引用
-                    local = new float[enh.Length];
-                    Array.Copy(enh, local, enh.Length);          // 立即拷走，避免被下一帧覆盖
+                    // 原始样本先进对齐队列，再推理：输出是输入的延迟镜像（m↔m），
+                    // Process 吐出的 N 个样本对应队头最旧的 N 个原始样本。
+                    for (int i = 0; i < hop.Length; i++) rawDelay.Enqueue(hop[i]);
+                    enh = processor.Process(hop);   // 新数组实例（StreamEnhancer），无需拷走
+                    rawAligned = new float[enh.Length];
+                    for (int i = 0; i < enh.Length; i++)
+                        rawAligned[i] = rawDelay.Count > 0 ? rawDelay.Dequeue() : enh[i];
                 }
                 double ms = sw.ElapsedTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-                float[] rawHop = hop;   // task 副本，闭包捕获，供混合使用
-                Loom.QueueOnMainThread(() => CommitOutput(local, rawHop, inRms, (float)ms));
+                Loom.QueueOnMainThread(() => CommitOutput(enh, rawAligned, inRms, (float)ms));
             }
             finally
             {
@@ -236,18 +248,23 @@ namespace DPDFNetUnity
         /// <summary>
         /// 主线程落地：混合(playbackMix) + 块级 AGC + 入播放队列 + 诊断累计。
         /// 由 Loom 泵送（或 monitorBypass 时由 DispatchHop 同步）调用，始终在主线程。
+        /// enh 为 StreamEnhancer 语义的可变长输出（hop 的整数倍；首窗未满 win_len 预热期为空），
+        /// rawHop 为与 enh 逐样本对齐的原始样本（DoInfer 中经 rawDelay 出队配对）。
         /// </summary>
         private void CommitOutput(float[] enh, float[] rawHop, float inRms, float inferMs)
         {
             lastInferenceMs = inferMs;
+            if (enh == null || enh.Length == 0) return;   // 预热期无输出，跳过
 
             float outRms;
             lock (queueLock)
             {
+                if (mixBuf == null || mixBuf.Length < enh.Length) mixBuf = new float[enh.Length];
                 double mSq = 0;
                 for (int i = 0; i < enh.Length; i++)
                 {
-                    float v = (1f - playbackMix) * enh[i] + playbackMix * rawHop[i];
+                    float raw = (rawHop != null && i < rawHop.Length) ? rawHop[i] : enh[i];
+                    float v = (1f - playbackMix) * enh[i] + playbackMix * raw;
                     mixBuf[i] = v;
                     mSq += v * v;
                 }
@@ -321,6 +338,7 @@ namespace DPDFNetUnity
             micClip = null;
             playClip = null;
             pending.Clear();
+            lock (inferLock) rawDelay.Clear();
             lock (queueLock) playbackQueue.Clear();
         }
     }

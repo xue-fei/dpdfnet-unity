@@ -1,7 +1,5 @@
 using System;
 using System.IO;
-using System.Numerics;
-using MathNet.Numerics.IntegralTransforms;
 using UnityEngine;
 
 namespace DPDFNetUnity
@@ -83,7 +81,7 @@ namespace DPDFNetUnity
                 var frame = new float[nFft];
                 int off = t * hop;
                 for (int i = 0; i < nFft; i++) frame[i] = xp[off + i] * win[i];
-                specRI[t] = Rfft(frame);
+                specRI[t] = StftMath.Rfft(frame);
             }
 
             // 4) 流式 ONNX（state 逐帧回传，对应 run_onnx_streaming）
@@ -102,7 +100,7 @@ namespace DPDFNetUnity
             float[] winSum = new float[expected];
             for (int t = 0; t < numFrames; t++)
             {
-                float[] td = Irfft(specE[t], nFft);
+                float[] td = StftMath.Irfft(specE[t], nFft);
                 int off = t * hop;
                 for (int i = 0; i < nFft; i++)
                 {
@@ -141,39 +139,6 @@ namespace DPDFNetUnity
             for (int i = 0; i < pad; i++) r[i] = x[pad - i];             // x[pad]..x[1]
             for (int i = 0; i < pad; i++) r[pad + L + i] = x[L - 2 - i]; // x[L-2]..x[L-1-pad]
             return r;
-        }
-
-        /// <summary>numpy.fft.rfft：前向不缩放，返回 [F*2] 交错 real/imag。</summary>
-        static float[] Rfft(float[] x)
-        {
-            int n = x.Length;
-            var buf = new Complex[n];
-            for (int i = 0; i < n; i++) buf[i] = new Complex(x[i], 0.0);
-            Fourier.Forward(buf, FourierOptions.Default);
-            int F = n / 2 + 1;
-            float[] ri = new float[F * 2];
-            for (int f = 0; f < F; f++)
-            {
-                ri[f * 2] = (float)buf[f].Real;
-                ri[f * 2 + 1] = (float)buf[f].Imaginary;
-            }
-            return ri;
-        }
-
-        /// <summary>numpy.fft.irfft：逆变换含 1/N，由 [F*2] 交错重建 n 点实信号。</summary>
-        static float[] Irfft(float[] specRI, int n)
-        {
-            int F = n / 2 + 1;
-            var full = new Complex[n];
-            for (int f = 0; f < F; f++) full[f] = new Complex(specRI[f * 2], specRI[f * 2 + 1]);
-            full[0] = new Complex(full[0].Real, 0.0);
-            full[F - 1] = new Complex(full[F - 1].Real, 0.0);
-            for (int k = 1; k < F - 1; k++)
-                full[n - k] = new Complex(full[k].Real, -full[k].Imaginary);
-            Fourier.Inverse(full, FourierOptions.Default);
-            float[] td = new float[n];
-            for (int i = 0; i < n; i++) td[i] = (float)full[i].Real;
-            return td;
         }
     }
 
