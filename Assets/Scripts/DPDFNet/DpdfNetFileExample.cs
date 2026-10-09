@@ -42,32 +42,35 @@ namespace DPDFNetUnity
             using var proc = new DpdfNetProcessor(cfg, session);
 
             int hop = proc.HopLength;
-            int nfft = cfg.n_fft;
 
-            // 3) 逐 hop 处理。末尾不足一个 hop 的残差用 0 补齐成整帧，
-            //    处理后再裁掉（见下方 clean 区间），不丢有效样本。
-            int frames = (samples.Length + hop - 1) / hop;
-            int padded = frames * hop;
-            float[] outBuf = new float[padded];
+            // 3) 逐 hop 处理。流式 STFT/ISTFT 为因果结构（对应 Python
+            //    real_time_demo.py 的 STFTStreamingPreprocess / ISTFTStreamingPostprocess）：
+            //    每帧输出是「上一帧输入」的增强结果，即整体带一个 hop 的固定延迟
+            //    （out_0 全 0，out_k = x_{k-1}）。因此：
+            //    - 末尾需多处理 1 帧（用 0 补齐），把最后一帧真实输入的输出冲出延迟线；
+            //    - 裁掉前导 hop（首帧的 0）后，取与原始输入等长的 hop+L 区间。
+            int frames = (samples.Length + hop - 1) / hop;   // 输入帧数 M = ceil(L/hop)
+            int outFrames = frames + 1;                       // 多 1 帧用于 flush 最后一段
+            int outLen = outFrames * hop;
+            float[] outBuf = new float[outLen];
 
-            for (int f = 0; f < frames; f++)
+            for (int f = 0; f < outFrames; f++)
             {
                 float[] hopIn = new float[hop];
                 int src = f * hop;
                 int n = Math.Min(hop, samples.Length - src);
-                if (n > 0) Array.Copy(samples, src, hopIn, 0, n); // 余下补 0（默认零初始化）
+                if (n > 0) Array.Copy(samples, src, hopIn, 0, n); // 越界部分默认 0（末帧 flush）
 
                 float[] hopOut = proc.ProcessFrame(hopIn);
                 Array.Copy(hopOut, 0, outBuf, f * hop, hop);
             }
 
-            // 4) 裁掉流式 ISTFT 的前导斜坡（约一个窗长 n_fft）与末尾补零，
-            //    得到与原始输入等长的干净结果。前导斜坡长度可调 n_fft ~ n_fft*2。
-            int frontTrim = Math.Min(nfft, outBuf.Length);
-            int cleanLen = Math.Max(0, samples.Length - frontTrim);
+            // 4) 裁掉前导 hop（流式 ISTFT 首帧为全 0），取与原始输入等长的部分，
+            //    得到与原始输入【完全等长】的干净结果（仅整体延迟一个 hop，约 10 ms@16k）。
+            int frontTrim = hop;
+            int cleanLen = samples.Length;
             float[] clean = new float[cleanLen];
-            if (cleanLen > 0)
-                Array.Copy(outBuf, frontTrim, clean, 0, cleanLen);
+            Array.Copy(outBuf, frontTrim, clean, 0, cleanLen);
 
             // 5) 写回 WAV（16 kHz 单声道 16-bit PCM）
             WavIo.Write(outputWav, clean, 16000, 1);

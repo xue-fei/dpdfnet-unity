@@ -78,7 +78,7 @@ ONNX 模型位于 `Assets/StreamingAssets/dpdfnet/`，Unity 端逐帧执行：
 - `OnnxRuntimeSession` 已设单线程 + `ORT_ENABLE_ALL` 图优化，与 Python 一致。
 - `IOnnxSession` 抽象便于替换为 **Unity Sentis**（`com.unity.sentis` 包，导入 ONNX 后在 GPU/CPU 上推理，免去原生 DLL），适合 iOS/Android 发布。
 - 实时路径在 `DpdfNetMicrophoneDemo` 的协程（`CaptureLoop`）内逐 hop 推理；若单帧耗时偏高，可把推理移到独立工作线程（生产/消费环形队列，保持采集与播放分离）。
-- 离线处理文件：直接循环调用 `DpdfNetProcessor.ProcessFrame`，最后裁剪前 `n_fft*2` 个样本（对应 Python `postprocess_spec` 的尾零对齐）。
+- 离线处理文件（流式路径，与 `real_time_demo.py` 的 `STFTStreamingPreprocess`/`ISTFTStreamingPostprocess` 一致）：逐 hop 调用 `DpdfNetProcessor.ProcessFrame`，**多处理 1 帧**（末帧用 0 补齐，把最后一帧真实输入的输出冲出延迟线），再裁掉前导 `hop` 个样本、取与输入**等长**的 `hop+L` 区间。流式 STFT 为因果结构，整体带一个 `hop` 的固定延迟（`out_0` 全 0、`out_k = x_{k-1}`），故输出长度与输入相同，仅整体后移约 10 ms@16k。
 
 ## 16 kHz 音频文件处理示例
 
@@ -102,8 +102,8 @@ DPDFNetUnity.DpdfNetFileExample.ProcessWav(modelPath, inputWav, outputWav);
 
 1. **读取**：`WavIo.TryRead` 把任意声道/位深转成单声道 `float[]`（归一化到 [-1,1]）；非 16 kHz 文件会告警（模型是 16k 训练的，建议先重采样）。
 2. **建处理器**：`new OnnxRuntimeSession(modelPath)` → `DpdfNetModelConfig.FromSession` → `new DpdfNetProcessor(cfg, session)`（处理器负责释放 session）。
-3. **逐 hop 处理**：以 `hop=160` 为步长切片；末尾不足一个 hop 的残差用 0 补齐成整帧（处理后再裁掉，不丢有效样本）。
-4. **裁边**：流式 ISTFT 首帧有约一个窗长（`n_fft`）的前导斜坡，裁掉前 `n_fft` 个样本（可调到 `n_fft*2`），再去掉末尾补零，得到与原始输入等长的干净结果。
+3. **逐 hop 处理**：以 `hop=160` 为步长切片，共处理 `M+1` 帧（`M = ceil(L/hop)`，末帧用 0 补齐）。多出的 1 帧用于把最后一帧真实输入的输出冲出延迟线（流式 STFT 因果，每帧输出对应「上一帧输入」）。
+4. **裁边对齐**：裁掉前导 `hop`（首帧输出全 0），取 `outBuf[hop : hop+L]`；得到与原始输入**完全等长**（L 样本）的结果。输出整体延迟一个 `hop`（约 10 ms@16k），这是因果流式结构的固有延迟，非长度丢失。
 5. **写回**：`WavIo.Write` 输出 16 kHz 单声道 16-bit PCM。
 
 ### 平台注意
