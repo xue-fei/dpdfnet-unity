@@ -10,33 +10,35 @@ ONNX 模型位于 `Assets/StreamingAssets/dpdfnet/`，Unity 端逐帧执行：
 ## 已就绪的资源
 
 - `Assets/StreamingAssets/dpdfnet/*.onnx`：baseline / dpdfnet2 / dpdfnet4 / dpdfnet8（均为 **16 kHz** 模型，参数 `sr=16000, n_fft=320, hop=160, freq_bins=161`）。
-- `Assets/Scripts/DPDFNet/`：C# 实现（已精简为 4 个文件，按层分组）：
+- `Assets/Scripts/DPDFNet/`：C# 实现（核心 4 个文件，按层分组，外加 1 个可选示例文件）：
 
   | 文件 | 职责 |
   |---|---|
   | `DpdfNetAudio.cs` | DSP 层：`VorbisWindow`（Vorbis 窗）、`StreamingStft`（流式 STFT）、`StreamingIstft`（流式 ISTFT，OLA） |
   | `OnnxRuntimeSession.cs` | ONNX 层：`IOnnxSession` 接口 + `OnnxRuntimeSession`（Microsoft.ML.OnnxRuntime 后端，含定制版 Tensor 扁平拷贝兼容） |
   | `DpdfNetProcessor.cs` | 模型配置 `DpdfNetModelConfig`（零依赖推导 + 初始 state 重建）+ 核心编排 `DpdfNetProcessor` |
-  | `DpdfNetMicrophoneDemo.cs` | `MonoBehaviour` Demo：麦克风 16k 采集 → 增强 → `AudioSource` 播放（无 `OnAudioFilterRead`、无重采样） |
+  | `DpdfNetMicrophoneDemo.cs` | `MonoBehaviour` Demo：麦克风 16k 采集 → 增强 → `AudioSource` 播放（无 `OnAudioFilterRead`、无重采样）。ONNX 推理经 `Loom` 后台线程执行，主线程仅做采集与落地，不阻塞帧率 |
+  | `DpdfNetFileExample.cs` | **可选示例**：对 16 kHz WAV 文件做离线降噪（`DpdfNetFileExample.ProcessWav` + 极简 `WavIo` 读写），见下方「16 kHz 音频文件处理示例」 |
 
 > **零依赖**：初始 state 与 DSP 参数均不在任何外部文件中。运行时从 ONNX 输入形状（`FreqBins` / `StateSize`）推导 `n_fft` / `hop` / `state_size`，并用与 Python `onnx_model/layers.py` 一致的公式重建 `ErbNorm` / `SpecNorm` 初值（仅两切片非零，其余为 0）。因此更换/重新导出 ONNX（同 16k 模型族）无需任何额外步骤。
 
-## 依赖（需要手动加入 Unity 工程）
+## 依赖（通过 Unity Package Manager 引入，仅需以下两个包）
 
-### 1. Microsoft.ML.OnnxRuntime（CPU）
-提供 ONNX 推理能力，API 与 Python `onnxruntime` 一一对应。
-- 取得 NuGet 包 `Microsoft.ML.OnnxRuntime`（CPU 版）。
-- 将托管程序集 `Microsoft.ML.OnnxRuntime.dll` 放入 `Assets/Plugins/OnnxRuntime/`。
-- 将**原生库**放入对应平台子目录并设置 Import Settings（Plugin 类型：
-  - Windows：`onnxruntime.dll`（x64/x86）→ `Assets/Plugins/OnnxRuntime/x86_64/`
-  - Linux：`libonnxruntime.so`；Android：`libonnxruntime.so`（需 ndk）；macOS：`libonnxruntime.dylib`；iOS：静态库 + bitcode。
-- 也可通过 Unity 的 NuGet 方案（如 `NuGetForUnity`）安装，本质相同。
+在 `Packages/manifest.json` 的 `dependencies` 中加入两个 git 包（已打包 ONNX 运行时与 CPU 原生库，无需手动放置 DLL）：
 
-### 2. MathNet.Numerics
-提供任意长度（320 点）FFT，与 `numpy.fft` 的实/虚 FFT 约定一致。
-- 取得 `MathNet.Numerics`（netstandard2.0 构建）。
-- 将 `MathNet.Numerics.dll` 放入 `Assets/Plugins/`。
-- 代码已使用 `System.Numerics.Complex`，Unity 内置支持。
+```json
+{
+  "dependencies": {
+    "onnxruntime": "https://github.com/xue-fei/onnxruntime-unity.git",
+    "onnxruntime-cpu": "https://github.com/xue-fei/onnxruntime-unity-cpu.git"
+  }
+}
+```
+
+- `onnxruntime`：提供 ONNX 推理能力，API 与 Python `onnxruntime` 一一对应（含托管包装与平台原生库）。
+- `onnxruntime-cpu`：CPU 后端原生库。
+
+保存后 Unity 会自动从 git 拉取并编译，无需 NuGet 或手动拷贝 DLL。
 
 ## 使用
 
@@ -77,3 +79,34 @@ ONNX 模型位于 `Assets/StreamingAssets/dpdfnet/`，Unity 端逐帧执行：
 - `IOnnxSession` 抽象便于替换为 **Unity Sentis**（`com.unity.sentis` 包，导入 ONNX 后在 GPU/CPU 上推理，免去原生 DLL），适合 iOS/Android 发布。
 - 实时路径在 `DpdfNetMicrophoneDemo` 的协程（`CaptureLoop`）内逐 hop 推理；若单帧耗时偏高，可把推理移到独立工作线程（生产/消费环形队列，保持采集与播放分离）。
 - 离线处理文件：直接循环调用 `DpdfNetProcessor.ProcessFrame`，最后裁剪前 `n_fft*2` 个样本（对应 Python `postprocess_spec` 的尾零对齐）。
+
+## 16 kHz 音频文件处理示例
+
+`DpdfNetFileExample.cs` 提供一行式离线降噪：读取 16 kHz WAV → 逐 hop 调 `DpdfNetProcessor.ProcessFrame` → 写回增强后的 WAV。仅依赖 onnxruntime 包，自带极简 `WavIo`（读 PCM 16/24/32-bit、float；写 16-bit PCM），无需 NAudio 等额外依赖。
+
+### 用法
+
+```csharp
+// 桌面 / Editor：直接用本地文件路径
+string model = @"C:\project\Assets\StreamingAssets\dpdfnet\dpdfnet2.onnx";
+string input = @"C:\audio\noisy_16k.wav";
+string output = @"C:\audio\enhanced_16k.wav";
+DPDFNetUnity.DpdfNetFileExample.ProcessWav(model, input, output);
+
+// Unity 运行时（如按钮回调），用 StreamingAssets 路径（桌面端可直接读）：
+string modelPath = System.IO.Path.Combine(Application.streamingAssetsPath, "dpdfnet", "dpdfnet2.onnx");
+DPDFNetUnity.DpdfNetFileExample.ProcessWav(modelPath, inputWav, outputWav);
+```
+
+### 关键逻辑（与 Python 离线路径对齐）
+
+1. **读取**：`WavIo.TryRead` 把任意声道/位深转成单声道 `float[]`（归一化到 [-1,1]）；非 16 kHz 文件会告警（模型是 16k 训练的，建议先重采样）。
+2. **建处理器**：`new OnnxRuntimeSession(modelPath)` → `DpdfNetModelConfig.FromSession` → `new DpdfNetProcessor(cfg, session)`（处理器负责释放 session）。
+3. **逐 hop 处理**：以 `hop=160` 为步长切片；末尾不足一个 hop 的残差用 0 补齐成整帧（处理后再裁掉，不丢有效样本）。
+4. **裁边**：流式 ISTFT 首帧有约一个窗长（`n_fft`）的前导斜坡，裁掉前 `n_fft` 个样本（可调到 `n_fft*2`），再去掉末尾补零，得到与原始输入等长的干净结果。
+5. **写回**：`WavIo.Write` 输出 16 kHz 单声道 16-bit PCM。
+
+### 平台注意
+
+- **Android / iOS**：`StreamingAssets` 在打包后位于 APK/IPA 内，无法以文件系统路径直接读取。需先把模型/音频拷贝到 `Application.persistentDataPath`（可读写），再传入 `ProcessWav`。
+- 示例 `WavIo` 仅覆盖常见格式且多声道写入简化（仅填第 0 声道）。生产环境可替换为 NAudio 或 Unity `AudioClip` 导入，但核心处理流程（`DpdfNetProcessor` 调用）不变。

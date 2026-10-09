@@ -1,6 +1,7 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Threading;
 using UnityEngine;
 
 namespace DPDFNetUnity
@@ -62,6 +63,15 @@ namespace DPDFNetUnity
         private int rmsFrames;
         private bool loggedModelError;
         private float agcGain = 1f;
+
+        // —— 后台推理（Loom）相关 ——
+        // DPDFNet 是 stateful 流式模型：state 必须逐帧串行传递，且 ProcessFrame 复用同一个
+        // outHop 数组返回。因此用 inferLock 把「推理 + 立即拷走结果」包成原子，既保证帧顺序
+        // 不被并发打乱，也避免复用缓冲被下一帧覆盖。
+        private readonly object inferLock = new object();
+        private int inflight;                       // 在途推理任务数（背压计数）
+        private const int MaxInflight = 2;          // 背压上限：超过则丢弃本帧
+        private int droppedFrames;                  // 诊断：因背压丢弃的帧数
 
         void Start() => Initialize();
         void OnDisable() => Cleanup();
@@ -157,74 +167,108 @@ namespace DPDFNetUnity
                     while (pending.Count >= hop)
                     {
                         for (int i = 0; i < hop; i++) hopBuf[i] = pending.Dequeue();
-                        ProcessHop(hopBuf);
+                        DispatchHop(hopBuf);   // 主线程只负责读+提交，重活在 Loom 后台线程
                     }
                 }
                 yield return null;
             }
         }
 
-        private void ProcessHop(float[] hop)
+        /// <summary>
+        /// 主线程调度：算出输入 RMS，把 hop 提交到后台线程推理（Loom，不阻塞主线程）。
+        /// 背压：在途任务超过上限则丢弃本帧（降质但不无限延迟）。
+        /// </summary>
+        private void DispatchHop(float[] hop)
         {
-            // 诊断：输入 RMS
             double inSq = 0;
             for (int i = 0; i < hop.Length; i++) inSq += hop[i] * hop[i];
             float inRms = (float)Math.Sqrt(inSq / hop.Length + 1e-12f);
 
-            float[] enh;
             if (monitorBypass)
             {
-                enh = hop;             // 跳过模型，原样透传
-                lastInferenceMs = 0f;
-            }
-            else
-            {
-                var sw = System.Diagnostics.Stopwatch.StartNew();
-                try
-                {
-                    enh = processor.ProcessFrame(hop);
-                }
-                catch (Exception e)
-                {
-                    if (!loggedModelError)
-                    {
-                        Debug.LogError($"[DPDFNet] 推理异常：{e.Message}");
-                        loggedModelError = true;
-                    }
-                    enh = hop;         // 异常时原样透传，避免静音
-                }
-                lastInferenceMs = (float)(sw.ElapsedTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
+                CommitOutput(hop, hop, inRms, 0f);   // 跳过模型，原样透传（主线程同步）
+                return;
             }
 
-            // 混合 + 块级 AGC（对应 Python apply_output_agc），结果写入 mixBuf。
+            // 背压：在途推理任务过多则丢弃本帧，避免 ThreadPool 堆积与无限延迟。
+            if (Interlocked.Increment(ref inflight) > MaxInflight)
+            {
+                Interlocked.Decrement(ref inflight);
+                droppedFrames++;
+                return;
+            }
+
+            // 拷贝 hop（hopBuf 会被协程下一轮复用），后台线程持有独立副本。
+            float[] task = new float[hop.Length];
+            Array.Copy(hop, task, hop.Length);
+            Loom.RunAsync(
+                () => DoInfer(task, inRms),
+                (ex) => { Interlocked.Decrement(ref inflight); Debug.LogError($"[DPDFNet] 推理异常：{ex.Message}"); });
+        }
+
+        /// <summary>
+        /// 后台线程：调用 ONNX 推理。用 inferLock 把「推理 + 立即拷走结果」包成原子——
+        /// 保证流式 state 的帧顺序（stateful 模型必须逐帧串行），并避免复用的 outHop
+        /// 被并发改写。推理耗时测好后再回主线程落地。
+        /// </summary>
+        private void DoInfer(float[] hop, float inRms)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            try
+            {
+                float[] local;
+                lock (inferLock)
+                {
+                    float[] enh = processor.ProcessFrame(hop);   // 返回复用的 outHop 引用
+                    local = new float[enh.Length];
+                    Array.Copy(enh, local, enh.Length);          // 立即拷走，避免被下一帧覆盖
+                }
+                double ms = sw.ElapsedTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                float[] rawHop = hop;   // task 副本，闭包捕获，供混合使用
+                Loom.QueueOnMainThread(() => CommitOutput(local, rawHop, inRms, (float)ms));
+            }
+            finally
+            {
+                Interlocked.Decrement(ref inflight);
+            }
+        }
+
+        /// <summary>
+        /// 主线程落地：混合(playbackMix) + 块级 AGC + 入播放队列 + 诊断累计。
+        /// 由 Loom 泵送（或 monitorBypass 时由 DispatchHop 同步）调用，始终在主线程。
+        /// </summary>
+        private void CommitOutput(float[] enh, float[] rawHop, float inRms, float inferMs)
+        {
+            lastInferenceMs = inferMs;
+
             float outRms;
             lock (queueLock)
             {
                 double mSq = 0;
-                for (int i = 0; i < hop.Length; i++)
+                for (int i = 0; i < enh.Length; i++)
                 {
-                    float v = (1f - playbackMix) * enh[i] + playbackMix * hop[i];
+                    float v = (1f - playbackMix) * enh[i] + playbackMix * rawHop[i];
                     mixBuf[i] = v;
                     mSq += v * v;
                 }
-                float rms = (float)Math.Sqrt(mSq / hop.Length + 1e-12f);
+                float rms = (float)Math.Sqrt(mSq / enh.Length + 1e-12f);
                 if (enableAgc)
                 {
                     const float targetRms = 0.12f, floor = 1e-3f, minGain = 0.25f, maxGain = 8f;
                     float desired = Mathf.Clamp(targetRms / Mathf.Max(rms, floor), minGain, maxGain);
                     agcGain = Mathf.Lerp(agcGain, desired, 0.05f);
-                    for (int i = 0; i < hop.Length; i++)
+                    for (int i = 0; i < enh.Length; i++)
                         mixBuf[i] = Mathf.Clamp(mixBuf[i] * agcGain, -1f, 1f);
-                    outRms = (float)Math.Sqrt((mSq * agcGain * agcGain) / hop.Length + 1e-12f);
+                    outRms = (float)Math.Sqrt((mSq * agcGain * agcGain) / enh.Length + 1e-12f);
                 }
                 else
                 {
-                    for (int i = 0; i < hop.Length; i++)
+                    for (int i = 0; i < enh.Length; i++)
                         mixBuf[i] = Mathf.Clamp(mixBuf[i], -1f, 1f);
                     outRms = rms;
                 }
 
-                for (int i = 0; i < hop.Length; i++) playbackQueue.Enqueue(mixBuf[i]);
+                for (int i = 0; i < enh.Length; i++) playbackQueue.Enqueue(mixBuf[i]);
                 while (playbackQueue.Count > MaxQueueSamples) playbackQueue.Dequeue(); // 溢出丢弃最旧
             }
 
@@ -257,7 +301,7 @@ namespace DPDFNetUnity
                 float avgOut = outRmsSum / rmsFrames;
                 int q;
                 lock (queueLock) q = playbackQueue.Count;
-                Debug.Log($"[DPDFNet] inRMS={avgIn:F4} outRMS={avgOut:F4} infer={lastInferenceMs:F2}ms bypass={monitorBypass} qPlay={q}");
+                Debug.Log($"[DPDFNet] inRMS={avgIn:F4} outRMS={avgOut:F4} infer={lastInferenceMs:F2}ms bypass={monitorBypass} qPlay={q} drop={droppedFrames}");
                 inRmsSum = outRmsSum = 0f;
                 rmsFrames = 0;
                 diagTimer = 0f;
